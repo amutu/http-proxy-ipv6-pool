@@ -1,12 +1,23 @@
 use hyper::{
-    client::HttpConnector,
     server::conn::AddrStream,
     service::{make_service_fn, service_fn},
     Body, Client, Method, Request, Response, Server, StatusCode,
 };
+#[cfg(not(target_os = "freebsd"))]
+use hyper::client::HttpConnector;
 use rand::{random, Rng};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use tokio::{ net::TcpSocket, task};
+#[cfg(target_os = "freebsd")]
+use tokio::net::TcpStream;
+#[cfg(target_os = "freebsd")]
+use std::future::Future;
+#[cfg(target_os = "freebsd")]
+use std::pin::Pin;
+#[cfg(target_os = "freebsd")]
+use std::task::{Context, Poll};
+#[cfg(target_os = "freebsd")]
+use hyper::service::Service;
 use std::sync::{Arc};
 use tokio::process::Command;
 use std::collections::{HashMap, VecDeque};
@@ -22,6 +33,7 @@ use hyper::upgrade::OnUpgrade;
 use cidr::{Ipv4Cidr, Ipv6Cidr};
 use rand::seq::SliceRandom;
 use socket2::{Socket, Domain, Type};
+#[cfg(not(target_os = "freebsd"))]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use get_if_addrs::{get_if_addrs, IfAddr};
 use crate::Socket2Connector::Socket2Connector;
@@ -261,6 +273,13 @@ impl Proxy {
             SocketAddr::V6(_) => TcpSocket::new_v6().unwrap(),
         };
 
+        // FreeBSD: pool addresses are not assigned to any interface, so the
+        // socket must opt in to binding them before bind(2).
+        #[cfg(target_os = "freebsd")]
+        if let Err(e) = crate::bindany::set_bindany(&socket, addr.is_ipv6()) {
+            println!("Failed to set BINDANY on socket: {}", e);
+        }
+
 
 
         let bind_addr = match addr {
@@ -282,19 +301,36 @@ impl Proxy {
 
             // 将TcpSocket转换为socket2::Socket以使用bind_device
             let interface_name = bind_iface.as_str();
-            let socket_fd = socket.as_raw_fd();
-            let socket2 = unsafe { socket2::Socket::from_raw_fd(socket_fd) };
-
-            // 绑定到指定接口
-            if let Err(e) = socket2.bind_device(Some(interface_name.as_bytes())) {
-                println!("Failed to bind to interface {}: {:?}", interface_name, e);
-                // 不要退出，继续尝试连接
+            #[cfg(target_os = "freebsd")]
+            {
+                // FreeBSD has no SO_BINDTODEVICE equivalent; bind the
+                // interface's source IP instead so egress follows the
+                // interface's address selection.
+                if let Some(interface_ip) = get_interface_ip(interface_name) {
+                    let bind_addr2 = SocketAddr::new(interface_ip, 0);
+                    if let Err(e) = socket.bind(bind_addr2) {
+                        println!("Failed to bind to interface IP {}: {}", bind_addr2, e);
+                    }
+                } else {
+                    println!("No IP found on interface {}, outgoing source will be default", interface_name);
+                }
             }
+            #[cfg(not(target_os = "freebsd"))]
+            {
+                let socket_fd = socket.as_raw_fd();
+                let socket2 = unsafe { socket2::Socket::from_raw_fd(socket_fd) };
 
-            // 重要：防止socket关闭（转移所有权但不关闭原始fd）
-            std::mem::forget(socket2);
+                // 绑定到指定接口
+                if let Err(e) = socket2.bind_device(Some(interface_name.as_bytes())) {
+                    println!("Failed to bind to interface {}: {:?}", interface_name, e);
+                    // 不要退出，继续尝试连接
+                }
 
-            // 不需要再绑定IP地址，因为我们已经绑定了接口
+                // 重要：防止socket关闭（转移所有权但不关闭原始fd）
+                std::mem::forget(socket2);
+
+                // 不需要再绑定IP地址，因为我们已经绑定了接口
+            }
         } else {
             // 如果没有指定接口，则继续使用原来的IP绑定方式
             println!("Binding to address {}", bind_addr);
@@ -459,22 +495,31 @@ impl Proxy {
         };
 
 
+        // On FreeBSD the HttpConnector path cannot work for pool addresses:
+        // it binds the local address internally WITHOUT setting
+        // IP_BINDANY/IPV6_BINDANY first, so bind(2) fails with
+        // EADDRNOTAVAIL. Use a custom connector that sets the option.
+        #[cfg(target_os = "freebsd")]
+        fn make_connector(local_ip: IpAddr) -> FreeBindConnector {
+            FreeBindConnector { local_ip }
+        }
+        #[cfg(not(target_os = "freebsd"))]
+        fn make_connector(local_ip: IpAddr) -> HttpConnector {
+            let mut connector = HttpConnector::new();
+            connector.set_local_address(Some(local_ip));
+            connector
+        }
+
         let http = match self.bind_interface {
             Some(ref bind_iface) => {
                 println!("Creating custom connector with interface binding to {}", bind_iface);
 
-                // 创建一个自定义连接器
-                let mut connector = hyper::client::HttpConnector::new();
-                connector.set_local_address(Some(local_ip));
-
                 // 创建一个Socket2连接器包装器
-                Socket2Connector::new(connector, Some(bind_iface.as_str()))
+                Socket2Connector::new(make_connector(local_ip), Some(bind_iface.as_str()))
             }
             None => {
-                // 如果没有指定接口，就使用标准HttpConnector
-                let mut connector = hyper::client::HttpConnector::new();
-                connector.set_local_address(Some(local_ip));
-                Socket2Connector::new(connector, None)
+                // 如果没有指定接口，就使用标准连接器
+                Socket2Connector::new(make_connector(local_ip), None)
             }
         };
 
@@ -595,6 +640,67 @@ impl Proxy {
                 .map_err(|e| eprintln!("Failed to execute command: {}. Error: {}", cmd_str, e))
                 .ok();
         });
+    }
+}
+
+/// hyper connector for FreeBSD: resolve the URI, create a socket, set
+/// IP_BINDANY/IPV6_BINDANY, bind to the pool address, then connect.
+/// Semantically equivalent to HttpConnector + set_local_address(local_ip),
+/// except that binding to addresses not assigned to any interface works.
+#[cfg(target_os = "freebsd")]
+#[derive(Clone)]
+struct FreeBindConnector {
+    local_ip: IpAddr,
+}
+
+#[cfg(target_os = "freebsd")]
+impl Service<hyper::Uri> for FreeBindConnector {
+    type Response = TcpStream;
+    type Error = std::io::Error;
+    type Future = Pin<Box<dyn Future<Output = std::io::Result<TcpStream>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: hyper::Uri) -> Self::Future {
+        let local_ip = self.local_ip;
+        // uri.host() returns IPv6 literals WITH brackets; strip them
+        let host = uri
+            .host()
+            .map(|h| h.trim_start_matches('[').trim_end_matches(']').to_owned());
+        let port = uri.port_u16().unwrap_or(80);
+        Box::pin(async move {
+            let host = host.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing host in URI")
+            })?;
+            let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
+            let mut last_err = None;
+            for addr in addrs {
+                let socket = match addr {
+                    SocketAddr::V4(_) => TcpSocket::new_v4()?,
+                    SocketAddr::V6(_) => TcpSocket::new_v6()?,
+                };
+                if let Err(e) = crate::bindany::set_bindany(&socket, addr.is_ipv6()) {
+                    last_err = Some(e);
+                    continue;
+                }
+                // same semantics as set_local_address: a family mismatch
+                // (e.g. v6 pool IP on a v4 socket) makes bind fail here and
+                // the next resolved address is tried
+                if let Err(e) = socket.bind(SocketAddr::new(local_ip, 0)) {
+                    last_err = Some(e);
+                    continue;
+                }
+                match socket.connect(addr).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Other, "no address resolved")
+            }))
+        })
     }
 }
 

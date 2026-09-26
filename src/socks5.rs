@@ -12,6 +12,7 @@ use std::io;
 use tokio::time::{timeout, Duration};
 use cidr::{Ipv4Cidr, Ipv6Cidr};
 use socket2::{Socket, Domain, Type};
+#[cfg(not(target_os = "freebsd"))]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use get_if_addrs::{get_if_addrs, IfAddr};
 
@@ -199,30 +200,34 @@ async fn handle_socks5_connection(
         },
     };
 
+    // FreeBSD: pool addresses are not assigned to any interface, so the
+    // socket must opt in to binding them before bind(2).
+    #[cfg(target_os = "freebsd")]
+    if let Err(e) = crate::bindany::set_bindany(&socket_type, addr.is_ipv6()) {
+        println!("Failed to set BINDANY on socket: {}", e);
+    }
+
 
 
     // 如果指定了接口，首先绑定到接口
     if let Some(interface_name) = bind_interface {
         println!("Binding SOCKS5 connection to interface: {}", interface_name);
 
-        // 1. 首先将 TcpSocket 转换为 socket2::Socket
-        let socket_fd = socket_type.as_raw_fd();
-        let socket2 = unsafe { socket2::Socket::from_raw_fd(socket_fd) };
-
-        // 2. 绑定到指定接口
-        if let Err(e) = socket2.bind_device(Some(interface_name.as_bytes())) {
-            println!("Failed to bind to interface {}: {:?}", interface_name, e);
-            // 由于 socket2 已经转移了所有权，我们必须忘记它以避免关闭原始 fd
-            std::mem::forget(socket2);
-
-            // 尝试退回到 IP 绑定方式
+        #[cfg(target_os = "freebsd")]
+        {
+            // FreeBSD has no SO_BINDTODEVICE equivalent; bind the
+            // interface's source IP instead, falling back to the pool
+            // address if the interface has no usable IP.
             let mut rng = rand::thread_rng();
             if let Some(interface_ip) = get_interface_ip(interface_name) {
                 println!("Fallback: Binding to IP {} from interface {}", interface_ip, interface_name);
                 let bind_addr2 = SocketAddr::new(interface_ip, rng.gen::<u16>());
                 if socket_type.bind(bind_addr2).is_err() {
                     println!("Failed to bind to interface IP {}", bind_addr2);
-                    return Err("Failed to bind to interface or interface IP".into());
+                    if socket_type.bind(bind_addr).is_err() {
+                        println!("Failed to bind to address {}", bind_addr);
+                        return Err("Failed to bind to interface or interface IP".into());
+                    }
                 }
             } else {
                 println!("Could not get IP for interface {}, using standard binding", interface_name);
@@ -231,17 +236,47 @@ async fn handle_socks5_connection(
                     return Err("Failed to bind to address".into());
                 }
             }
-        } else {
-            // 绑定接口成功，记得忘记 socket2 以保持 socket_type 有效
-            std::mem::forget(socket2);
+        }
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            // 1. 首先将 TcpSocket 转换为 socket2::Socket
+            let socket_fd = socket_type.as_raw_fd();
+            let socket2 = unsafe { socket2::Socket::from_raw_fd(socket_fd) };
 
-            // 可选：还可以绑定到接口 IP，提供更完整的控制
-            let mut rng = rand::thread_rng();
-            if let Some(interface_ip) = get_interface_ip(interface_name) {
-                println!("Additionally binding to IP {} from interface {}", interface_ip, interface_name);
-                let bind_addr2 = SocketAddr::new(interface_ip, rng.gen::<u16>());
-                // 忽略绑定错误，因为我们已经绑定到了接口
-                let _ = socket_type.bind(bind_addr2);
+            // 2. 绑定到指定接口
+            if let Err(e) = socket2.bind_device(Some(interface_name.as_bytes())) {
+                println!("Failed to bind to interface {}: {:?}", interface_name, e);
+                // 由于 socket2 已经转移了所有权，我们必须忘记它以避免关闭原始 fd
+                std::mem::forget(socket2);
+
+                // 尝试退回到 IP 绑定方式
+                let mut rng = rand::thread_rng();
+                if let Some(interface_ip) = get_interface_ip(interface_name) {
+                    println!("Fallback: Binding to IP {} from interface {}", interface_ip, interface_name);
+                    let bind_addr2 = SocketAddr::new(interface_ip, rng.gen::<u16>());
+                    if socket_type.bind(bind_addr2).is_err() {
+                        println!("Failed to bind to interface IP {}", bind_addr2);
+                        return Err("Failed to bind to interface or interface IP".into());
+                    }
+                } else {
+                    println!("Could not get IP for interface {}, using standard binding", interface_name);
+                    if socket_type.bind(bind_addr).is_err() {
+                        println!("Failed to bind to address {}", bind_addr);
+                        return Err("Failed to bind to address".into());
+                    }
+                }
+            } else {
+                // 绑定接口成功，记得忘记 socket2 以保持 socket_type 有效
+                std::mem::forget(socket2);
+
+                // 可选：还可以绑定到接口 IP，提供更完整的控制
+                let mut rng = rand::thread_rng();
+                if let Some(interface_ip) = get_interface_ip(interface_name) {
+                    println!("Additionally binding to IP {} from interface {}", interface_ip, interface_name);
+                    let bind_addr2 = SocketAddr::new(interface_ip, rng.gen::<u16>());
+                    // 忽略绑定错误，因为我们已经绑定到了接口
+                    let _ = socket_type.bind(bind_addr2);
+                }
             }
         }
     } else {

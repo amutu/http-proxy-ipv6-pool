@@ -1,5 +1,8 @@
 mod proxy;
 mod socks5;
+#[cfg(target_os = "freebsd")]
+mod bindany;
+#[cfg(not(target_os = "freebsd"))]
 mod forward;
 mod Socket2Connector;
 
@@ -10,6 +13,7 @@ use socks5::start_socks5_proxy;
 use std::{env, net::IpAddr, net::SocketAddr, process::exit};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(not(target_os = "freebsd"))]
 use forward::{parse_forward_mapping, start_forward_proxy};
 fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} [options]", program);
@@ -134,6 +138,14 @@ async fn main() {
     };
 
     // 解析并存储代理映射
+    // (The forward module relies on curl-impersonate, which has no FreeBSD
+    //  support; it is compiled out there. Fail loudly instead of ignoring.)
+    #[cfg(target_os = "freebsd")]
+    if !matches.opt_strs("forward").is_empty() {
+        eprintln!("Error: --forward is not supported on FreeBSD (curl-impersonate unavailable).");
+        exit(1);
+    }
+    #[cfg(not(target_os = "freebsd"))]
     let forward_mappings = matches
         .opt_strs("forward")
         .into_iter()
@@ -141,6 +153,7 @@ async fn main() {
         .collect::<Vec<_>>();
 
     // 启动代理映射任务
+    #[cfg(not(target_os = "freebsd"))]
     for mapping in forward_mappings {
         let ipv6_subnets = ipv6_subnets.clone();
         let ipv4_subnets = ipv4_subnets.clone();

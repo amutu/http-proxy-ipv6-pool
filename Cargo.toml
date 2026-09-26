@@ -18,20 +18,25 @@ hyper = { version = "0.14", features = ["client", "server", "http1", "runtime"] 
 tokio = { version = "1", features = ["full"] }
 rand = "0.8"
 lazy_static = "1.4.0"
+base64 = "0.22.1"
+libc = "0.2"
+socket2 = "0.5.7"
+get_if_addrs = "0.5.3"
+
+# The forward module (curl-impersonate based) has no FreeBSD support and is
+# compiled out there (src/main.rs cfg). Its dependencies are declared here so
+# that FreeBSD builds do not pull in openssl/aws-lc-sys at all.
+[target.'cfg(not(target_os = "freebsd"))'.dependencies]
 tokio-socks = "0.5.2"
 socks = "0.3"
-base64 = "0.22.1"
 tokio-rustls = "0.26.0"
 webpki-roots = "0.26.6"
 tokio-native-tls = "0.3.1"
 native-tls = "0.2.12"
 httparse = "1.9.4"
-libc = "0.2"
 scopeguard = "1.2.0"
 regex = "1"
 openssl = { version = "0.10", features = ["vendored"] }
-socket2 = "0.5.7"
-get_if_addrs = "0.5.3"
 
 [profile.release]
 strip = true

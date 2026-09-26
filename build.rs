@@ -65,6 +65,11 @@ fn main() {
         println!("cargo:rustc-link-lib=static=ssl");
         println!("cargo:rustc-link-lib=static=crypto");
     }
+    // FreeBSD: the forward module (curl-impersonate) has no FreeBSD support
+    // and is compiled out (src/main.rs cfg), so there is nothing to link here.
+    else if target.contains("freebsd") {
+        println!("cargo:rerun-if-changed=build.rs");
+    }
     // 其他平台直接报错
     else {
         panic!("Unsupported TARGET: {}", target);

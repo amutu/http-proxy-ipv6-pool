@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use std::net::SocketAddr;
+#[cfg(not(target_os = "freebsd"))]
 use std::os::fd::{AsRawFd, FromRawFd};
 
 // 自定义 Socket2Connector
@@ -48,19 +49,28 @@ where
 
             // 如果指定了接口，绑定到接口
             if let Some(iface) = interface {
-                // 获取底层文件描述符
-                let socket_fd = tcp_stream.as_raw_fd();
-
-                // 创建 socket2::Socket
-                let socket = unsafe { socket2::Socket::from_raw_fd(socket_fd) };
-
-                // 绑定到指定接口
-                if let Err(e) = socket.bind_device(Some(iface.as_bytes())) {
-                    println!("Failed to bind to interface {}: {:?}", iface, e);
+                // FreeBSD: no SO_BINDTODEVICE; interface binding is done at
+                // socket creation time in proxy.rs / socks5.rs instead.
+                #[cfg(target_os = "freebsd")]
+                {
+                    let _ = iface;
                 }
+                #[cfg(not(target_os = "freebsd"))]
+                {
+                    // 获取底层文件描述符
+                    let socket_fd = tcp_stream.as_raw_fd();
 
-                // 防止 socket 关闭
-                std::mem::forget(socket);
+                    // 创建 socket2::Socket
+                    let socket = unsafe { socket2::Socket::from_raw_fd(socket_fd) };
+
+                    // 绑定到指定接口
+                    if let Err(e) = socket.bind_device(Some(iface.as_bytes())) {
+                        println!("Failed to bind to interface {}: {:?}", iface, e);
+                    }
+
+                    // 防止 socket 关闭
+                    std::mem::forget(socket);
+                }
             }
 
             Ok(SocketConnection { inner: tcp_stream })
